@@ -1,0 +1,105 @@
+name: Build Pixel 8 Kernel (GitHub-hosted)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_variant:
+        description: "KernelSU variant (enhance/tiann/kowsu)"
+        default: enhance
+        type: choice
+        options: [enhance, tiann, kowsu]
+      create_release:
+        description: "Create GitHub Release"
+        default: true
+        type: boolean
+      tuning_profile:
+        description: "Pixel 8 tuning profile"
+        default: balanced
+        type: choice
+        options: [balanced, performance, battery]
+      lto_mode:
+        description: "LTO mode"
+        default: thin
+        type: choice
+        options: [thin, full, none]
+      governor_mode:
+        description: "CPU governor mode"
+        default: dynasched
+        type: choice
+        options: [dynasched, stock_schedutil]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    env:
+      GITHUB_WORKSPACE: ${{ github.workspace }}
+      KSU_VARIANT: ${{ github.event.inputs.ksu_variant }}
+      TUNING_PROFILE: ${{ github.event.inputs.tuning_profile }}
+      LTO_MODE: ${{ github.event.inputs.lto_mode }}
+      GOVERNOR_MODE: ${{ github.event.inputs.governor_mode }}
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git wget curl python3 python3-pip xz-utils bc build-essential dwarves libncurses-dev libssl-dev bison flex
+
+      - name: Setup LLVM/Clang
+        run: |
+          wget https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.8/clang+llvm-17.0.8-x86_64-linux-gnu-ubuntu-22.04.tar.xz
+          tar -xf clang+llvm-17.0.8-x86_64-linux-gnu-ubuntu-22.04.tar.xz -C $HOME
+          echo "$HOME/clang+llvm-17.0.8-x86_64-linux-gnu-ubuntu-22.04/bin" >> $GITHUB_PATH
+
+      - name: Setup ccache and temp dirs
+        run: |
+          mkdir -p $HOME/.ccache $HOME/tmp
+          export CCACHE_DIR=$HOME/.ccache
+          export TMPDIR=$HOME/tmp
+
+      - name: Prepare kernel build environment
+        run: |
+          export PATH=$HOME/clang+llvm-17.0.8-x86_64-linux-gnu-ubuntu-22.04/bin:$PATH
+          export CCACHE_DIR=$HOME/.ccache
+          export TMPDIR=$HOME/tmp
+          export MAKEFLAGS="-j$(nproc) -l$((nproc+1))"
+          mkdir -p out logs success-metadata
+
+      - name: Apply patches & prepare SuSFS/KernelSU
+        run: |
+          bash .github/scripts/apply-remote-patches.sh
+          bash .github/scripts/susfs_patch_apply.sh
+
+      - name: Build kernel
+        run: |
+          bash .github/scripts/build-kernel.sh
+
+      - name: Generate runtime tuner
+        run: |
+          bash .github/scripts/generate-runtime-tuner.sh
+
+      - name: Prepare AnyKernel3 ZIP
+        run: |
+          bash .github/scripts/anykernel3_prep.sh AnyKernel3
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: kernel-artifacts-${{ github.run_id }}
+          path: |
+            out/arch/arm64/boot/Image
+            AnyKernel3/*.zip
+            success-metadata/pixel8-runtime-tuner-${{ env.KSU_VARIANT }}.sh
+            logs/
+
+      - name: Create GitHub Release
+        if: ${{ github.event.inputs.create_release == 'true' }}
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.run_id }}
+          name: Pixel 8 Kernel Build ${{ github.run_id }}
+          files: |
+            AnyKernel3/*.zip
