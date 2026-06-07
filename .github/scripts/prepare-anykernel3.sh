@@ -1,19 +1,22 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 AK3_DIR="${1:-AnyKernel3}"
+ANDROID_LABEL="${ANDROID_VERSION:-Android GKI}"
+KERNEL_STRING="${KERNEL_STRING:-Pixel 8 Series ${ANDROID_LABEL} GKI Kernel by deepongi @ deepongi-labs}"
 
 if [ ! -f "${AK3_DIR}/anykernel.sh" ]; then
   echo "::error::${AK3_DIR}/anykernel.sh not found"
   exit 1
 fi
 
-python3 - "${AK3_DIR}/anykernel.sh" <<'PY'
+python3 - "${AK3_DIR}/anykernel.sh" "$KERNEL_STRING" <<'PY'
 from pathlib import Path
 import re
 import sys
 
 path = Path(sys.argv[1])
+kernel_string = sys.argv[2]
 text = path.read_text()
 
 def set_property(body: str, key: str, value: str) -> str:
@@ -21,10 +24,13 @@ def set_property(body: str, key: str, value: str) -> str:
     replacement = f'{key}={value}'
     if pattern.search(body):
         return pattern.sub(replacement, body, count=1)
-    return body.replace("'; } # end properties", f'{replacement}\n\'; }} # end properties', 1)
+    marker = "'; } # end properties"
+    if marker not in body:
+        raise SystemExit(f"properties end marker not found while setting {key}")
+    return body.replace(marker, f'{replacement}\n\'; }} # end properties', 1)
 
 for key, value in {
-    'kernel.string': 'Pixel 8 Series Android 16 GKI Kernel by deepongi @ deepongi-labs',
+    'kernel.string': kernel_string,
     'do.devicecheck': '1',
     'do.modules': '0',
     'do.systemless': '1',
@@ -45,26 +51,26 @@ for key, value in {
 text = re.sub(r'^block=.*$', 'block=/dev/block/by-name/boot;', text, count=1, flags=re.MULTILINE)
 text = re.sub(r'^is_slot_device=.*$', 'is_slot_device=1;', text, count=1, flags=re.MULTILINE)
 
-if 'HEADER_VER=$(grep "HEADER_VER"' in text:
-    text = text.replace(
-        'HEADER_VER=$(grep "HEADER_VER" /tmp/anykernel/split_img/boot.img-header_version 2>/dev/null || echo "0")',
-        'HEADER_VER=$(grep "HEADER_VER" /tmp/anykernel/split_img/boot.img-header_version 2>/dev/null | grep -oE "[0-9]+" | head -1 || echo "0")',
-    )
+# Some AnyKernel3 forks parse a whole key=value line as an integer. Keep only
+# the numeric payload so boot header v4/no-ramdisk images do not trip guards.
+text = text.replace(
+    'HEADER_VER=$(grep "HEADER_VER" /tmp/anykernel/split_img/boot.img-header_version 2>/dev/null || echo "0")',
+    'HEADER_VER=$(grep "HEADER_VER" /tmp/anykernel/split_img/boot.img-header_version 2>/dev/null | grep -oE "[0-9]+" | head -1 || echo "0")',
+)
+text = text.replace(
+    'RAMDISK_SIZE=$(grep "RAMDISK_SZ" /tmp/anykernel/ramdisk_size 2>/dev/null || echo "0")',
+    'RAMDISK_SIZE=$(grep "RAMDISK_SZ" /tmp/anykernel/ramdisk_size 2>/dev/null | grep -oE "[0-9]+" | head -1 || echo "0")',
+)
 
-if 'RAMDISK_SIZE=$(grep "RAMDISK_SZ"' in text:
-    text = text.replace(
-        'RAMDISK_SIZE=$(grep "RAMDISK_SZ" /tmp/anykernel/ramdisk_size 2>/dev/null || echo "0")',
-        'RAMDISK_SIZE=$(grep "RAMDISK_SZ" /tmp/anykernel/ramdisk_size 2>/dev/null | grep -oE "[0-9]+" | head -1 || echo "0")',
-    )
-
-if 'Pixel 8 series / Android 16 guard' not in text:
+if 'Pixel 8 series / Android GKI guard' not in text:
     marker = '## AnyKernel boot install\n'
-    guard = '''## Pixel 8 series / Android 16 guard
+    guard = '''## Pixel 8 series / Android GKI guard
 ui_print "Target: Pixel 8 series (shiba/husky/akita)";
-ui_print "Android 16 boot images are supported (boot header v4/no boot ramdisk).";
+ui_print "Android GKI boot images are supported (including boot header v4/no boot ramdisk).";
 
 '''
-    text = text.replace(marker, marker + guard, 1)
+    if marker in text:
+        text = text.replace(marker, marker + guard, 1)
 
 path.write_text(text)
 PY
@@ -83,4 +89,4 @@ if ! grep -Eq '^block=/dev/block/by-name/boot;' "${AK3_DIR}/anykernel.sh"; then
   exit 1
 fi
 
-echo "✅ AnyKernel3 prepared for Pixel 8 series Android 16 GKI packaging"
+echo "AnyKernel3 prepared for Pixel 8 series GKI packaging"

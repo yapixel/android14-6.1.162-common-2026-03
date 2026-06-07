@@ -1,5 +1,46 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${GITHUB_WORKSPACE:=$(pwd)}"
+: "${KSU_VARIANT:=enhance}"
+: "${KERNELTOAST_PATCH_POLICY:=best_effort}"
+: "${GOVERNOR_MODE:=dynasched}"
+: "${DIRTY_MODULE_ABI_BYPASS:=true}"
+: "${PATCH_MANIFEST:=${GITHUB_WORKSPACE}/logs/patch-manifest-${KSU_VARIANT}.txt}"
+: "${PATCH_FAILURE_LOG:=${GITHUB_WORKSPACE}/logs/patch-failure-${KSU_VARIANT}.log}"
+
+mkdir -p "${GITHUB_WORKSPACE}/logs"
+: > "$PATCH_FAILURE_LOG"
+# Preserve SuSFS entries if setup-susfs.sh already wrote to the manifest.
+[ -f "$PATCH_MANIFEST" ] || : > "$PATCH_MANIFEST"
+
+if [ -n "${GITHUB_ENV:-}" ]; then
+  echo "PATCH_MANIFEST=$PATCH_MANIFEST" >> "$GITHUB_ENV"
+  echo "PATCH_FAILURE_LOG=$PATCH_FAILURE_LOG" >> "$GITHUB_ENV"
+fi
+
+record_patch() {
+  local desc="$1"
+  local source="$2"
+  local status="$3"
+  printf '%s | %s | %s\n' "$desc" "$source" "$status" >> "$PATCH_MANIFEST"
+}
+
+log_patch_failure() {
+  local patch_file="$1"
+  local description="$2"
+  local temp_log
+  temp_log="$(mktemp)"
+  patch -p1 --forward --dry-run < "$patch_file" >"$temp_log" 2>&1 || true
+  {
+    echo "=== ${description} ==="
+    echo "Patch: $patch_file"
+    cat "$temp_log"
+    echo
+  } >> "$PATCH_FAILURE_LOG"
+  rm -f "$temp_log"
+}
+
 fetch_patch_or_fail() {
   local url="$1"
   local destination="$2"
@@ -10,15 +51,31 @@ apply_patch_or_fail() {
   local patch_file="$1"
   local description="$2"
 
+  if [ ! -s "$patch_file" ]; then
+    echo "::error::Patch file missing or empty: $patch_file"
+    record_patch "$description" "$patch_file" "missing"
+    exit 1
+  fi
+
   if patch -p1 --forward --dry-run < "$patch_file" >/dev/null 2>&1; then
     patch -p1 --forward < "$patch_file"
+    record_patch "$description" "$patch_file" "applied"
   elif patch -p1 --reverse --dry-run < "$patch_file" >/dev/null 2>&1; then
-    echo "ℹ️ ${description} already present, skipping."
+    echo "Already present: $description"
+    record_patch "$description" "$patch_file" "already-present"
+  elif patch -p1 --forward --fuzz=3 --dry-run < "$patch_file" >/dev/null 2>&1; then
+    echo "Applying with fuzz=3: $description"
+    patch -p1 --forward --fuzz=3 < "$patch_file"
+    record_patch "$description" "$patch_file" "applied-fuzz"
   elif git apply --3way --check "$patch_file" >/dev/null 2>&1; then
-    echo "📋 Applying patch with 3-way merge: $description"
+    echo "Applying with git 3-way: $description"
     git apply --3way "$patch_file"
+    record_patch "$description" "$patch_file" "applied-3way"
   else
-    echo "❌ ${description} could not be applied cleanly: $patch_file"
+    echo "::error::$description could not be applied cleanly: $patch_file"
+    record_patch "$description" "$patch_file" "failed"
+    log_patch_failure "$patch_file" "$description"
+    echo "Patch failure log: $PATCH_FAILURE_LOG"
     exit 1
   fi
 }
@@ -26,80 +83,95 @@ apply_patch_or_fail() {
 apply_repo_patch_or_fail() {
   local patch_file="$1"
   local description="$2"
-  apply_patch_or_fail "$GITHUB_WORKSPACE/$patch_file" "$description"
+  apply_patch_or_fail "${GITHUB_WORKSPACE}/${patch_file}" "$description"
 }
 
 apply_remote_patch_with_policy() {
   local url="$1"
   local local_name="$2"
   local description="$3"
-
   local destination="/tmp/${local_name}"
+
   if ! curl --fail --location --silent --show-error "$url" -o "$destination"; then
-    if [ "${KERNELTOAST_PATCH_POLICY}" = "strict" ]; then
-      echo "❌ ${description} download failed in strict mode: ${url}"
+    if [ "$KERNELTOAST_PATCH_POLICY" = "strict" ]; then
+      echo "::error::$description download failed in strict mode: $url"
       exit 1
     fi
-    echo "⚠️  Skipping ${description}: failed to download ${url}"
+    echo "Skipping $description: failed to download $url"
+    record_patch "$description" "$url" "skipped-download-failed"
     return 0
   fi
   if [ ! -s "$destination" ]; then
-    if [ "${KERNELTOAST_PATCH_POLICY}" = "strict" ]; then
-      echo "❌ ${description} downloaded empty patch in strict mode: ${url}"
+    if [ "$KERNELTOAST_PATCH_POLICY" = "strict" ]; then
+      echo "::error::$description downloaded empty patch in strict mode: $url"
       exit 1
     fi
-    echo "⚠️  Skipping ${description}: downloaded empty patch from ${url}"
+    echo "Skipping $description: empty patch from $url"
+    record_patch "$description" "$url" "skipped-empty"
     return 0
   fi
 
-  if [ "${KERNELTOAST_PATCH_POLICY}" = "strict" ]; then
+  if [ "$KERNELTOAST_PATCH_POLICY" = "strict" ]; then
     if git apply --check "$destination" >/dev/null 2>&1; then
       git apply "$destination"
-      echo "✅ Applied ${description}"
-      printf '%s | %s | applied-strict\n' "$description" "$url" >> "${PATCH_MANIFEST:-/dev/null}"
+      echo "Applied $description"
+      record_patch "$description" "$url" "applied-strict"
       return 0
     fi
     if git apply --reverse --check "$destination" >/dev/null 2>&1; then
-      echo "ℹ️ ${description} already present, skipping."
-      printf '%s | %s | already-present-strict\n' "$description" "$url" >> "${PATCH_MANIFEST:-/dev/null}"
+      echo "Already present: $description"
+      record_patch "$description" "$url" "already-present-strict"
       return 0
     fi
-    echo "❌ ${description} failed strict git apply check: ${url}"
-    echo "::group::${description} strict apply diagnostics"
+    echo "::group::$description strict apply diagnostics"
     git apply --check --verbose "$destination" || true
     echo "::endgroup::"
+    echo "::error::$description failed strict git apply check: $url"
     exit 1
   fi
 
   if patch -p1 --forward --dry-run < "$destination" >/dev/null 2>&1; then
     patch -p1 --forward < "$destination"
-    echo "✅ Applied ${description}"
-    printf '%s | %s | applied\n' "$description" "$url" >> "${PATCH_MANIFEST:-/dev/null}"
+    echo "Applied $description"
+    record_patch "$description" "$url" "applied"
   elif patch -p1 --reverse --dry-run < "$destination" >/dev/null 2>&1; then
-    echo "ℹ️ ${description} already present, skipping."
-    printf '%s | %s | already-present\n' "$description" "$url" >> "${PATCH_MANIFEST:-/dev/null}"
+    echo "Already present: $description"
+    record_patch "$description" "$url" "already-present"
   elif git apply --3way --check "$destination" >/dev/null 2>&1; then
-    echo "📋 Applying patch with 3-way merge: $description"
+    echo "Applying with 3-way merge: $description"
     git apply --3way "$destination"
-    echo "✅ Applied ${description} via 3-way merge"
-    printf '%s | %s | applied-3way\n' "$description" "$url" >> "${PATCH_MANIFEST:-/dev/null}"
+    record_patch "$description" "$url" "applied-3way"
   else
-    if [ "${KERNELTOAST_PATCH_POLICY}" = "strict" ]; then
-      echo "❌ ${description} failed to apply cleanly in strict mode"
-      exit 1
-    fi
-    echo "⚠️  Skipping ${description}: patch drift against current kernel ref"
-    printf '%s | %s | skipped-stale\n' "$description" "$url" >> "${PATCH_MANIFEST:-/dev/null}"
+    echo "Skipping $description: patch drift against current kernel ref"
+    record_patch "$description" "$url" "skipped-stale"
   fi
+}
+
+optional_python_patch() {
+  local description="$1"
+  local source="$2"
+  shift 2
+
+  if "$@"; then
+    echo "Applied $description"
+    record_patch "$description" "$source" "applied-adapted"
+    return 0
+  fi
+
+  if [ "$KERNELTOAST_PATCH_POLICY" = "strict" ]; then
+    echo "::error::$description failed in strict mode"
+    record_patch "$description" "$source" "failed-strict"
+    exit 1
+  fi
+  echo "Skipping $description: context drifted"
+  record_patch "$description" "$source" "skipped-stale"
+  return 0
 }
 
 apply_upstream_lts_patch_if_needed() {
   local target_sublevel="${UPSTREAM_LTS_PATCH_LEVEL:-}"
   local patch_url="${UPSTREAM_LTS_PATCH_URL:-}"
-  local current_version
-  local current_patchlevel
-  local current_sublevel
-  local patch_file
+  local current_version current_patchlevel current_sublevel patch_file
 
   [ -n "$target_sublevel" ] || return 0
   [ -n "$patch_url" ] || return 0
@@ -110,58 +182,49 @@ apply_upstream_lts_patch_if_needed() {
 
   case "$target_sublevel:$current_sublevel" in
     *[!0-9:]*|:|*:)
-      echo "❌ Invalid upstream LTS patch level state: target=${target_sublevel}, current=${current_sublevel}"
+      echo "::error::Invalid upstream LTS patch level state: target=${target_sublevel}, current=${current_sublevel}"
       exit 1
       ;;
   esac
 
   if [ "$current_version" != "6" ] || [ "$current_patchlevel" != "1" ]; then
-    echo "⏭️  Upstream 6.1.${target_sublevel} patch skipped: kernel is ${current_version}.${current_patchlevel}.${current_sublevel}"
-    printf 'upstream linux stable 6.1.%s | %s | skipped-not-6.1\n' "$target_sublevel" "$patch_url" >> "${PATCH_MANIFEST:-/dev/null}"
+    echo "Upstream 6.1.${target_sublevel} patch skipped: kernel is ${current_version}.${current_patchlevel}.${current_sublevel}"
+    record_patch "upstream linux stable 6.1.${target_sublevel}" "$patch_url" "skipped-not-6.1"
     return 0
   fi
 
   if [ "$current_sublevel" -ge "$target_sublevel" ]; then
-    echo "ℹ️ Kernel already at 6.1.${current_sublevel}; upstream 6.1.${target_sublevel} patch not needed."
-    printf 'upstream linux stable 6.1.%s | %s | already-at-or-newer\n' "$target_sublevel" "$patch_url" >> "${PATCH_MANIFEST:-/dev/null}"
+    echo "Kernel already at 6.1.${current_sublevel}; upstream 6.1.${target_sublevel} patch not needed."
+    record_patch "upstream linux stable 6.1.${target_sublevel}" "$patch_url" "already-at-or-newer"
     return 0
   fi
 
   if [ $((target_sublevel - current_sublevel)) -ne 1 ]; then
-    echo "❌ Refusing to apply single upstream 6.1.${target_sublevel} patch on top of 6.1.${current_sublevel}; expected 6.1.$((target_sublevel - 1))."
+    echo "::error::Refusing to apply single upstream 6.1.${target_sublevel} patch on top of 6.1.${current_sublevel}; expected 6.1.$((target_sublevel - 1))."
     exit 1
   fi
 
-  command -v xz >/dev/null || { echo "❌ xz not found; cannot unpack ${patch_url}"; exit 1; }
+  command -v xz >/dev/null || { echo "::error::xz not found; cannot unpack ${patch_url}"; exit 1; }
   patch_file="/tmp/upstream-linux-6.1.${target_sublevel}.patch"
   curl --fail --location --silent --show-error "$patch_url" | xz -dc > "$patch_file"
-
-  if [ ! -s "$patch_file" ]; then
-    echo "❌ upstream 6.1.${target_sublevel} patch download produced an empty file"
-    exit 1
-  fi
-
   apply_patch_or_fail "$patch_file" "upstream Linux stable 6.1.${target_sublevel}"
-  printf 'upstream linux stable 6.1.%s | %s | applied\n' "$target_sublevel" "$patch_url" >> "${PATCH_MANIFEST:-/dev/null}"
+  record_patch "upstream linux stable 6.1.${target_sublevel}" "$patch_url" "applied"
 }
 
 apply_kerneltoast_adapted_patches() {
-  local processed=0
+  echo "Applying adapted kerneltoast scheduler/power commits (${KERNELTOAST_PATCH_POLICY})..."
 
-  echo "🚀 Applying adapted kerneltoast scheduler/power commits (${KERNELTOAST_PATCH_POLICY})..."
-
-  apply_remote_patch_with_policy "${KT_PATCH_ARCH_TOPOLOGY_MIN_FREQ_SCALE_URL}" "kt-arch-topology-min-freq-scale.patch" "kerneltoast: arch_topology minimum frequency scale"
-  processed=$((processed + 1))
+  apply_remote_patch_with_policy "${KT_PATCH_ARCH_TOPOLOGY_MIN_FREQ_SCALE_URL}" \
+    "kt-arch-topology-min-freq-scale.patch" \
+    "kerneltoast: arch_topology minimum frequency scale"
 
   if [ -f kernel/sched/cass.c ]; then
-    python3 - <<'PY'
+    optional_python_patch "kerneltoast: sched/cass uclamp packing threshold" "kernel/sched/cass.c" python3 - <<'PY'
 from pathlib import Path
-
 path = Path('kernel/sched/cass.c')
 text = path.read_text()
 if 'arch_scale_min_freq_capacity(cpu)' in text:
     raise SystemExit(0)
-
 old = '''\t\t\t/*
 \t\t\t * A non-idle candidate may be better for energy
 \t\t\t * efficiency when @p is uclamp boosted, or when the
@@ -194,19 +257,16 @@ if old not in text:
     raise SystemExit('kerneltoast CASS adaptation context not found')
 path.write_text(text.replace(old, new, 1))
 PY
-    echo "✅ Applied kerneltoast: sched/cass uclamp packing threshold"
-    printf '%s | %s | applied-adapted\n' "kerneltoast: sched/cass uclamp packing threshold" "kernel/sched/cass.c" >> "${PATCH_MANIFEST:-/dev/null}"
   else
-    echo "ℹ️ kerneltoast: sched/cass uclamp packing threshold not applicable; kernel/sched/cass.c is absent in this GKI tree."
-    printf '%s | %s | not-applicable-no-cass\n' "kerneltoast: sched/cass uclamp packing threshold" "kernel/sched/cass.c" >> "${PATCH_MANIFEST:-/dev/null}"
+    echo "kerneltoast CASS adaptation not applicable; kernel/sched/cass.c absent."
+    record_patch "kerneltoast: sched/cass uclamp packing threshold" "kernel/sched/cass.c" "not-applicable-no-cass"
   fi
-  processed=$((processed + 1))
 
-  python3 - <<'PY'
+  optional_python_patch "kerneltoast: schedutil ignore FIE rate-limit on scale-up" "kernel/sched/cpufreq_schedutil.c" python3 - <<'PY'
 from pathlib import Path
-
 path = Path('kernel/sched/cpufreq_schedutil.c')
 text = path.read_text()
+changed = False
 if 'static bool sugov_should_rate_limit' not in text:
     old = '''static bool sugov_should_update_freq(struct sugov_policy *sg_policy, u64 time)
 {
@@ -249,7 +309,7 @@ static bool sugov_should_update_freq(struct sugov_policy *sg_policy, u64 time)
     if old not in text:
         raise SystemExit('sugov_should_update_freq rate-limit context not found')
     text = text.replace(old, new, 1)
-
+    changed = True
 if 'must_update:' not in text:
     old = '''\t\tif (sg_policy->next_freq == next_freq &&
 \t\t    !cpufreq_driver_test_flags(CPUFREQ_NEED_UPDATE_LIMITS))
@@ -280,16 +340,12 @@ must_update:
     if old not in text:
         raise SystemExit('sugov_update_next_freq context not found')
     text = text.replace(old, new, 1)
-
+    changed = True
 path.write_text(text)
 PY
-  echo "✅ Applied kerneltoast: schedutil ignore FIE rate-limit on scale-up"
-  printf '%s | %s | applied-adapted\n' "kerneltoast: schedutil ignore FIE rate-limit on scale-up" "kernel/sched/cpufreq_schedutil.c" >> "${PATCH_MANIFEST:-/dev/null}"
-  processed=$((processed + 1))
 
-  python3 - <<'PY'
+  optional_python_patch "kerneltoast: schedutil default rate-limit 2000us" "kernel/sched/cpufreq_schedutil.c" python3 - <<'PY'
 from pathlib import Path
-
 path = Path('kernel/sched/cpufreq_schedutil.c')
 text = path.read_text()
 old = 'tunables->rate_limit_us = cpufreq_policy_transition_delay_us(policy);'
@@ -298,102 +354,85 @@ if old in text:
     text = text.replace(old, new, 1)
 path.write_text(text)
 PY
-  echo "✅ Applied kerneltoast: schedutil default rate-limit 2000us"
-  printf '%s | %s | applied-adapted\n' "kerneltoast: schedutil default rate-limit 2000us" "kernel/sched/cpufreq_schedutil.c" >> "${PATCH_MANIFEST:-/dev/null}"
-  processed=$((processed + 1))
 
-  if [ "${KERNELTOAST_PATCH_POLICY}" = "strict" ] && [ "$processed" -ne 4 ]; then
-    echo "❌ Strict kerneltoast expected 4 commits, processed ${processed}"
-    exit 1
-  fi
-  echo "✅ Kerneltoast patchset processed ${processed}/4 commits (${KERNELTOAST_PATCH_POLICY})"
+  echo "Kerneltoast patchset processed (${KERNELTOAST_PATCH_POLICY})"
 }
 
-cd kernel
+cd "${GITHUB_WORKSPACE}/kernel"
 
-# 0. Upstream Linux stable patch for android14-6.1-lts when the checked-out
-# LTS branch is exactly one sublevel behind the requested stable point.
 apply_upstream_lts_patch_if_needed
 
-# 1. GKI ABI symbol checks: keep stripped on akita.
-# Background: removing android/abi_gki_protected_exports_* lets the
-# kernel add new EXPORT_SYMBOLs without ABI-hash check failures.
-# On Pixel 8 (akita) Wi-Fi (BCM4389) the vendor module needs symbols
-# that aren't in the protected list, so leaving the file in place
-# blocks Wi-Fi module load. We strip by default; opt out by setting
-# KEEP_PROTECTED_EXPORTS=true if/when the underlying symbol is
-# added to the GKI protected ABI properly.
 if [ "${KEEP_PROTECTED_EXPORTS:-false}" = "true" ]; then
-  echo "🔒 Keeping android/abi_gki_protected_exports_* (KEEP_PROTECTED_EXPORTS=true)"
+  echo "Keeping android/abi_gki_protected_exports_* (KEEP_PROTECTED_EXPORTS=true)"
 else
-  echo "🚫 Removing GKI protected exports (akita Wi-Fi BCM4389 workaround)..."
+  echo "Removing GKI protected exports for Pixel 8 vendor module compatibility..."
   rm -f android/abi_gki_protected_exports_* || true
+  record_patch "GKI protected exports removal" "android/abi_gki_protected_exports_*" "removed"
 fi
 
-# 2. CLIDR uninitialized fix (use local copy, not a remote SHA-pinned URL)
 apply_repo_patch_or_fail ".github/patches/fix-clidr-uninitialized.patch" "CLIDR initialization fix"
 
-# 3. (Optional) Wi-Fi patch from OnePlus 12 (Qualcomm SM8650 tree)
-# Tensor G3 (Pixel 8, akita) uses Broadcom BCM4389 Wi-Fi, NOT QCA.
-# The 3-way fallback in apply_patch_or_fail can land hunks in the wrong
-# place on a foreign WLAN driver, panicking on first wpa_supplicant up.
-# Disabled by default; opt in with apply_oneplus12_wifi_patch=true.
 if [ "${APPLY_ONEPLUS12_WIFI_PATCH:-false}" = "true" ]; then
-  echo "📶 Applying OnePlus 12 (SM8650) Wi-Fi patch (opt-in)..."
+  echo "Applying OnePlus 12 (SM8650) Wi-Fi patch (opt-in)..."
   fetch_patch_or_fail "${WIFI_PATCH_URL}" /tmp/wifi-fix.patch
-  if [ -s /tmp/wifi-fix.patch ]; then echo "✅ Wi-Fi patch downloaded"; else echo "❌ Wi-Fi patch missing"; exit 1; fi
   apply_patch_or_fail /tmp/wifi-fix.patch "Wi-Fi fix"
 else
-  echo "⏭️  OnePlus 12 (SM8650) Wi-Fi patch skipped: incompatible with Pixel 8 (BCM4389)"
+  echo "OnePlus 12 (SM8650) Wi-Fi patch skipped: incompatible with Pixel 8 BCM4389"
+  record_patch "OnePlus 12 Wi-Fi patch" "${WIFI_PATCH_URL:-unset}" "skipped-incompatible"
 fi
 
-# 3b. Apply selected kerneltoast 16.0.0-sultan optimizations.
 if [ "${KERNELTOAST_PATCH_POLICY}" != "off" ]; then
   apply_kerneltoast_adapted_patches
 else
-  echo "⏭️  kerneltoast patchset disabled by policy"
+  echo "kerneltoast patchset disabled by policy"
+  record_patch "kerneltoast patchset" "policy" "disabled"
 fi
 
-# 4. Fix KernelSU stack overflow in variant trees that still carry this implementation.
 if [ -f "drivers/kernelsu/app_profile.c" ] && grep -q "char comm\\[TASK_COMM_LEN\\];" drivers/kernelsu/app_profile.c; then
-  python -c 'from pathlib import Path; p=Path("drivers/kernelsu/app_profile.c"); t=p.read_text(); p.write_text(t.replace("char comm[TASK_COMM_LEN];", "static char comm[TASK_COMM_LEN];", 1))'
-  echo "✅ app_profile stack workaround applied"
+  python3 - <<'PY'
+from pathlib import Path
+p = Path('drivers/kernelsu/app_profile.c')
+t = p.read_text()
+p.write_text(t.replace('char comm[TASK_COMM_LEN];', 'static char comm[TASK_COMM_LEN];', 1))
+PY
+  echo "app_profile stack workaround applied"
+  record_patch "app_profile stack workaround" "drivers/kernelsu/app_profile.c" "applied"
 else
-  echo "⏭️  app_profile stack workaround not needed"
+  echo "app_profile stack workaround not needed"
+  record_patch "app_profile stack workaround" "drivers/kernelsu/app_profile.c" "not-needed"
 fi
 
-# 5. Fix localversion script appending dirty flags
 apply_repo_patch_or_fail ".github/patches/global/fix_setlocalversion_dirty.patch" "setlocalversion dirty suffix fix"
 
 if [ "${DIRTY_MODULE_ABI_BYPASS}" = "true" ]; then
-  echo "⚠️  Applying dirty vendor module ABI bypass"
+  echo "Applying dirty vendor module ABI bypass"
   apply_repo_patch_or_fail ".github/patches/global/dirty_allow_vendor_module_crcs.patch" "dirty vendor module CRC bypass"
   apply_repo_patch_or_fail ".github/patches/global/dirty_allow_vendor_module_vermagic.patch" "dirty vendor module vermagic bypass"
 fi
 
-# 6. Fix libbpf compilation error
-echo "🔧 Patching libbpf.c type casting..."
 apply_repo_patch_or_fail ".github/patches/global/fix_libbpf_strchr_cast.patch" "libbpf strchr cast fix"
 
 if [ "${GOVERNOR_MODE}" = "dynasched" ]; then
-  echo "🔧 Installing dynasched cluster-aware governor..."
-  cp "$GITHUB_WORKSPACE/.github/patches/global/cpufreq_dynasched.c" \
-     kernel/sched/cpufreq_dynasched.c
-  # Check if patch is already applied using reverse dry-run (most reliable for dirty builds)
-  if patch -p1 --reverse --dry-run < "$GITHUB_WORKSPACE/.github/patches/global/add_dynasched_governor.patch" >/dev/null 2>&1; then
-    echo "ℹ️ dynasched governor patch already applied, skipping."
-    printf 'dynasched governor | kernel/sched/build_utility.c+drivers/cpufreq/Kconfig | already-present\n' >> "${PATCH_MANIFEST:-/dev/null}"
+  echo "Installing dynasched cluster-aware governor..."
+  if [ ! -f "${GITHUB_WORKSPACE}/.github/patches/global/cpufreq_dynasched.c" ]; then
+    echo "::error::Missing dynasched source: .github/patches/global/cpufreq_dynasched.c"
+    exit 1
+  fi
+  cp "${GITHUB_WORKSPACE}/.github/patches/global/cpufreq_dynasched.c" kernel/sched/cpufreq_dynasched.c
+
+  if patch -p1 --reverse --dry-run < "${GITHUB_WORKSPACE}/.github/patches/global/add_dynasched_governor.patch" >/dev/null 2>&1; then
+    echo "dynasched governor patch already applied, skipping."
+    record_patch "dynasched governor" "kernel/sched+drivers/cpufreq" "already-present"
   else
     apply_repo_patch_or_fail ".github/patches/global/add_dynasched_governor.patch" "dynasched governor"
-    printf 'dynasched governor | kernel/sched/build_utility.c+drivers/cpufreq/Kconfig | applied\n' >> "${PATCH_MANIFEST:-/dev/null}"
   fi
 
   if ! grep -q '^CONFIG_CPU_FREQ_GOV_DYNASCHED=y$' arch/arm64/configs/gki_defconfig 2>/dev/null; then
     echo "CONFIG_CPU_FREQ_GOV_DYNASCHED=y" >> arch/arm64/configs/gki_defconfig
   fi
+
   python3 - <<'PY'
 from pathlib import Path
-
 path = Path('drivers/cpufreq/Kconfig')
 text = path.read_text()
 if 'CPU_FREQ_DEFAULT_GOV_DYNASCHED' not in text:
@@ -411,7 +450,8 @@ path.write_text(text)
 PY
   sed -i '/^CONFIG_CPU_FREQ_DEFAULT_GOV_/d' arch/arm64/configs/gki_defconfig
   echo "CONFIG_CPU_FREQ_DEFAULT_GOV_DYNASCHED=y" >> arch/arm64/configs/gki_defconfig
-  printf 'dynasched governor source | kernel/sched/cpufreq_dynasched.c | applied\n' >> "${PATCH_MANIFEST:-/dev/null}"
+  record_patch "dynasched governor source" "kernel/sched/cpufreq_dynasched.c" "applied"
 else
-  echo "⏭️  dynasched governor disabled by governor_mode=${GOVERNOR_MODE}"
+  echo "dynasched governor disabled by governor_mode=${GOVERNOR_MODE}"
+  record_patch "dynasched governor" "governor_mode=${GOVERNOR_MODE}" "disabled"
 fi

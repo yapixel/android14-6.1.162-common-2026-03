@@ -1,8 +1,13 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${GITHUB_WORKSPACE:=$(pwd)}"
+: "${KSU_VARIANT:=enhance}"
+: "${ANDROID_VERSION:=android16}"
+: "${KSU_STAGE:=${GITHUB_WORKSPACE}/.ksu-src}"
 mkdir -p "$GITHUB_WORKSPACE/logs"
-PATCH_MANIFEST="$GITHUB_WORKSPACE/logs/patch-manifest-${KSU_VARIANT}.txt"
-PATCH_FAILURE_LOG="$GITHUB_WORKSPACE/logs/patch-failure-${KSU_VARIANT}.log"
+PATCH_MANIFEST="${PATCH_MANIFEST:-$GITHUB_WORKSPACE/logs/patch-manifest-${KSU_VARIANT}.txt}"
+PATCH_FAILURE_LOG="${PATCH_FAILURE_LOG:-$GITHUB_WORKSPACE/logs/patch-failure-${KSU_VARIANT}.log}"
 : > "$PATCH_MANIFEST"
 : > "$PATCH_FAILURE_LOG"
 
@@ -149,7 +154,7 @@ ensure_namespace_trace_hook_include() {
     'insert = "#include \"internal.h\"\n#include <trace/hooks/blk.h>\n"' \
     'if marker not in text: raise SystemExit("namespace.c layout drifted; could not inject trace/hooks include")' \
     'path.write_text(text.replace(marker, insert, 1))' \
-    | python -
+    | python3 -
 
   printf '%s | %s | applied\n' "Namespace trace hook include" "fs/namespace.c" >> "$PATCH_MANIFEST"
 }
@@ -176,7 +181,7 @@ auto_merge_tiann_ksu_susfs_patch() {
     'replace_re("kernel/feature/kernel_umount.c", r"<<<<<<< ours\n.*?=======\n>>>>>>> theirs\n", "")' \
     'replace_re("kernel/policy/app_profile.c", r"<<<<<<< ours\n\s*struct task_struct \*p = current;\n\s*struct task_struct \*t;\n\s*struct root_profile \*profile = NULL;\n=======\n\s*struct root_profile profile;\n>>>>>>> theirs\n", "    struct root_profile *profile = NULL;\n")' \
     'replace_re("kernel/policy/app_profile.c", r"<<<<<<< ours\n\s*for_each_thread \(p, t\) \{\n\s*ksu_set_task_tracepoint_flag\(t\);\n\s*\}\n\s*\n\s*setup_mount_ns\(profile->namespaces\);\n\s*ksu_put_root_profile\(profile\);\n=======\n\s*setup_mount_ns\(profile\.namespaces\);\n>>>>>>> theirs\n", "    setup_mount_ns(profile->namespaces);\n    ksu_put_root_profile(profile);\n")' \
-    | python -
+    | python3 -
 
   if grep -R "<<<<<<<\|>>>>>>>" -n kernel >/tmp/ksu-susfs-conflicts.txt; then
     head /tmp/ksu-susfs-conflicts.txt
@@ -192,9 +197,19 @@ echo "🧹 Resetting kernel tree for clean SuSFS patch application..."
 cd "${GITHUB_WORKSPACE}/kernel"
 git reset --hard HEAD
 git clean -fdx
-cd "${KSU_STAGE:-${GITHUB_WORKSPACE}/.ksu-src}"
-git reset --hard HEAD
-git clean -fdx
+KSU_STAGE="${KSU_STAGE:-${GITHUB_WORKSPACE}/.ksu-src}"
+if [ ! -d "$KSU_STAGE" ]; then
+  echo "::error::KSU_STAGE does not exist after kernel clean: $KSU_STAGE"
+  echo "For tiann/enhance, KernelSU setup.sh should have created kernel/KernelSU before setup-susfs.sh."
+  exit 1
+fi
+cd "$KSU_STAGE"
+if [ -d .git ]; then
+  git reset --hard HEAD
+  git clean -fdx
+else
+  echo "::warning::$KSU_STAGE is not a git checkout; skipping git reset/clean"
+fi
 cd "${GITHUB_WORKSPACE}"
 
 # Copy SuSFS source files per upstream instructions
@@ -242,7 +257,13 @@ if [ "$KSU_VARIANT" = "tiann" ] || [ "$KSU_VARIANT" = "enhance" ]; then
   if [ -f fs/namespace.c.rej ]; then
     echo "📋 Applying namespace.c fix for tiann/enhance..."
     patch -p1 < ../.github/patches/common/namespace_fix_for_tiann.patch
-    ../scripts/susfs_namespace_patcher.py fs/namespace.c --no-backup || true
+    if [ -x "$GITHUB_WORKSPACE/.github/scripts/susfs_namespace_patcher.py" ]; then
+      "$GITHUB_WORKSPACE/.github/scripts/susfs_namespace_patcher.py" fs/namespace.c --no-backup || true
+    elif [ -f "$GITHUB_WORKSPACE/.github/scripts/susfs_namespace_patcher.py" ]; then
+      python3 "$GITHUB_WORKSPACE/.github/scripts/susfs_namespace_patcher.py" fs/namespace.c --no-backup || true
+    else
+      echo "::warning::susfs_namespace_patcher.py not found; continuing after namespace_fix_for_tiann.patch"
+    fi
     rm -f fs/namespace.c.rej
     printf '%s | %s | applied\n' "Namespace fix for tiann" "../.github/patches/common/namespace_fix_for_tiann.patch + ../scripts/susfs_namespace_patcher.py" >> "$PATCH_MANIFEST"
   fi
@@ -423,7 +444,7 @@ if [ "$KSU_VARIANT" = "tiann" ] || [ "$KSU_VARIANT" = "kowsu" ] || [ "$KSU_VARIA
     '    text = target.read_text()' \
     '    if "susfs_run_sus_path_loop();" in text:' \
     '        target.write_text(text.replace("susfs_run_sus_path_loop();", "(void)0; /* symbol not available in this variant */"))' \
-    | python -
+    | python3 -
   printf '%s | %s | applied\n' "Disable missing sus_path loop call (tiann/kowsu/enhance)" "kernel/hook/setuid_hook.c" >> "$PATCH_MANIFEST"
 fi
 
@@ -431,4 +452,3 @@ if [ -n "${GITHUB_ENV:-}" ]; then
   echo "PATCH_MANIFEST=$PATCH_MANIFEST" >> "$GITHUB_ENV"
   echo "PATCH_FAILURE_LOG=$PATCH_FAILURE_LOG" >> "$GITHUB_ENV"
 fi
-

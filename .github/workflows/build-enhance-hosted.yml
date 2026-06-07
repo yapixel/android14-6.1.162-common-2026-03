@@ -1,7 +1,7 @@
-name: Build Enhance Kernel (Dedicated) for Pixel 8 Series
+name: Build Enhance Kernel (GitHub-hosted) for Pixel 8 Series
 
 concurrency:
-  group: enhance-kernel-build-v2-${{ github.ref_name }}
+  group: enhance-kernel-build-hosted-${{ github.ref_name }}
   cancel-in-progress: true
 
 permissions:
@@ -24,7 +24,7 @@ on:
       enable_telegram:
         description: 'Enable Telegram notifications'
         required: false
-        default: true
+        default: false
         type: boolean
       create_release:
         description: 'Create GitHub Release with artifacts'
@@ -36,19 +36,13 @@ on:
         required: false
         default: 'balanced'
         type: choice
-        options:
-          - balanced
-          - performance
-          - battery
+        options: [balanced, performance, battery]
       lto_mode:
-        description: 'LTO mode (thin/full/none)'
+        description: 'LTO mode'
         required: false
         default: 'thin'
         type: choice
-        options:
-          - thin
-          - full
-          - none
+        options: [thin, full, none]
       make_jobs:
         description: 'Parallel make jobs (auto or integer)'
         required: false
@@ -64,70 +58,56 @@ on:
         required: false
         default: 'dynasched'
         type: choice
-        options:
-          - dynasched
-          - stock_schedutil
+        options: [dynasched, stock_schedutil]
       kerneltoast_patch_policy:
-        description: 'Policy for kerneltoast patchset application (off = recommended; patches drift against android14-6.1)'
+        description: 'Kerneltoast patch policy'
         required: false
         default: 'best_effort'
         type: choice
-        options:
-          - strict
-          - best_effort
-          - 'off'
+        options: [strict, best_effort, 'off']
       dry_run_only:
         description: 'Validate source sync and patch application only'
         required: false
         default: false
         type: boolean
       dirty_build:
-        description: 'Incremental build: skip source cleanup, preserve out/ directory'
+        description: 'Incremental build; useful only on persistent runners'
         required: false
         default: false
         type: boolean
       dirty_module_abi_bypass:
-        description: 'Allow loading the built-in KernelSU kernel without requiring android14-6.1_kernelsu.ko'
+        description: 'Allow loading built-in KSU kernel without matching kernelsu.ko ABI'
         required: false
         default: true
         type: boolean
-      kernel_ref:
-        description: 'Override kernel ref'
+      android_version:
+        description: 'Android version target'
         required: false
-        default: 'android14-6.1-lts'
+        default: 'android16'
+        type: choice
+        options: [android14, android16, android17]
+      kernel_ref:
+        description: 'Override kernel ref. Leave empty to use workflow default for android_version.'
+        required: false
+        default: ''
         type: string
       susfs_ref:
-        description: 'Override SuSFS ref'
+        description: 'Override SuSFS ref. Leave empty to use workflow default for android_version.'
         required: false
-        default: 'gki-android14-6.1-dev'
+        default: ''
         type: string
       tiann_ref:
-        description: 'Override tiann KernelSU ref'
+        description: 'Override Tiann KernelSU ref for non-enhance tooling'
         required: false
-        default: 'da8e0ab1786dc55cce3ed4ff4c304be614e0fa0a'
-        type: string
-      kowsu_ref:
-        description: 'Override kowsu KernelSU ref'
-        required: false
-        default: 'master'
-        type: string
-      resukisu_ref:
-        description: 'Override ReSukiSU ref'
-        required: false
-        default: 'main'
-        type: string
-      next_ref:
-        description: 'Override KernelSU-Next ref'
-        required: false
-        default: 'dev'
+        default: '0544f475962fd7f27d27ae24a7ab3ee2a8d7538a'
         type: string
       stock_boot_img_url:
-        description: 'URL to the stock akita boot.img to repack with the new kernel (https://). Leave empty to skip repack.'
+        description: 'URL to stock akita boot.img. Enhance skips boot repack by default; keep empty normally.'
         required: false
         default: ''
         type: string
       stock_boot_gdrive_id:
-        description: 'Google Drive file ID for stock akita boot.img to repack. Leave empty to skip.'
+        description: 'Google Drive file ID or URL for stock akita boot.img. Keep empty normally.'
         required: false
         default: ''
         type: string
@@ -135,8 +115,9 @@ on:
 jobs:
   build-enhance:
     uses: ./.github/workflows/kernel-build.yml
+    secrets: inherit
     with:
-      use_self_hosted: true
+      use_self_hosted: false
       ksu_variant: enhance
       disable_susfs: ${{ inputs.disable_susfs }}
       force_clean_build: ${{ inputs.force_clean_build }}
@@ -144,13 +125,11 @@ jobs:
       create_release: ${{ inputs.create_release }}
       dry_run_only: ${{ inputs.dry_run_only }}
       dirty_build: ${{ inputs.dirty_build }}
+      android_version: ${{ inputs.android_version }}
       refs: |
         kernel_ref=${{ inputs.kernel_ref }}
         susfs_ref=${{ inputs.susfs_ref }}
         tiann_ref=${{ inputs.tiann_ref }}
-        kowsu_ref=${{ inputs.kowsu_ref }}
-        resukisu_ref=${{ inputs.resukisu_ref }}
-        next_ref=${{ inputs.next_ref }}
       build_options: |
         tuning_profile=${{ inputs.tuning_profile }}
         lto_mode=${{ inputs.lto_mode }}

@@ -1,4 +1,12 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${GITHUB_WORKSPACE:=$(pwd)}"
+: "${KSU_VARIANT:=enhance}"
+: "${GOVERNOR_MODE:=dynasched}"
+: "${RUNTIME_TUNER:=true}"
+
+cd "$GITHUB_WORKSPACE"
 mkdir -p success-metadata
 TUNER_SCRIPT="success-metadata/pixel8-runtime-tuner-${KSU_VARIANT}.sh"
 GOV_MODE="${GOVERNOR_MODE}"
@@ -399,4 +407,3 @@ EOF
 
 sed -i "s/__GOV_MODE__/${GOV_MODE}/g" "$TUNER_SCRIPT"
 chmod +x "$TUNER_SCRIPT"
-
