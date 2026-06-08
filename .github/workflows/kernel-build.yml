@@ -362,11 +362,11 @@ jobs:
             RESOLVED_KERNEL_REF_ANDROID17="${KERNEL_REF_ANDROID17:-${ANDROID17_KERNEL_REF}}"
           elif [ "$ANDROID_VERSION" = "android16" ]; then
             RESOLVED_KERNEL_REF="${KERNEL_REF:-${ANDROID16_KERNEL_REF}}"
-            RESOLVED_SUSFS_REF="${SUSFS_REF:-gki-android14-6.1-dev}"
+            RESOLVED_SUSFS_REF="${SUSFS_REF:-gki-android14-6.1}"
             RESOLVED_KERNEL_REF_ANDROID17="${KERNEL_REF_ANDROID17:-${ANDROID17_KERNEL_REF}}"
           else
-            RESOLVED_KERNEL_REF="${KERNEL_REF:-android14-6.1-lts}"
-            RESOLVED_SUSFS_REF="${SUSFS_REF:-gki-android14-6.1-dev}"
+            RESOLVED_KERNEL_REF="${KERNEL_REF:-android14-6.1}"
+            RESOLVED_SUSFS_REF="${SUSFS_REF:-gki-android14-6.1}"
             RESOLVED_KERNEL_REF_ANDROID17="${KERNEL_REF_ANDROID17:-${ANDROID17_KERNEL_REF}}"
           fi
 
@@ -677,7 +677,19 @@ jobs:
 
       - name: Setup SuSFS
         if: env.ENABLE_SUSFS == 'true'
-        run: bash .github/scripts/setup-susfs.sh
+        run: |
+          case "${KSU_VARIANT}" in
+            kowsu)
+              echo "::group::Setting up SuSFS for KowSU"
+              bash .github/scripts/setup-susfs-kowsu.sh
+              echo "::endgroup::"
+              ;;
+            *)
+              echo "::group::Setting up SuSFS for ${KSU_VARIANT}"
+              bash .github/scripts/setup-susfs.sh
+              echo "::endgroup::"
+              ;;
+          esac
 
       - name: Inject SuSFS Kconfig for KernelSU-Next
         if: env.ENABLE_SUSFS == 'true' && env.KSU_VARIANT == 'next'
